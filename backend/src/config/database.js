@@ -47,6 +47,7 @@ export async function getAllEvents(limit = 100) {
 export async function initViolationLogs() {
   const client = await pool.connect();
   try {
+    // Parking states: IDLE, SOMETHING_DETECTED, VEHICLE_DETECTED, VIOLATION
     await client.query(`
       CREATE TABLE IF NOT EXISTS violation_logs (
         id SERIAL PRIMARY KEY,
@@ -55,13 +56,33 @@ export async function initViolationLogs() {
         details TEXT,
         resolved BOOLEAN DEFAULT false,
         resolved_at TIMESTAMP,
+        video_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_violation_logs_node_id ON violation_logs(node_id);
     `);
-    console.log('✅ Violation logs table initialized');
+    
+    // Parking session tracking
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS parking_sessions (
+        id SERIAL PRIMARY KEY,
+        node_id VARCHAR(255) NOT NULL,
+        parking_state VARCHAR(100) DEFAULT 'IDLE',
+        detection_time TIMESTAMP,
+        vehicle_detection_time TIMESTAMP,
+        violation_time TIMESTAMP,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_parking_sessions_node_id ON parking_sessions(node_id);
+    `);
+    
+    console.log('✅ Violation logs and parking sessions tables initialized');
   } finally {
     client.release();
   }
@@ -74,6 +95,80 @@ export async function logViolation(nodeId, type, details) {
     RETURNING *;
   `;
   const result = await pool.query(query, [nodeId, type, details]);
+  return result.rows[0];
+}
+
+// Parking state management
+export async function createParkingSession(nodeId) {
+  const query = `
+    INSERT INTO parking_sessions (node_id, parking_state)
+    VALUES ($1, 'IDLE')
+    RETURNING *;
+  `;
+  const result = await pool.query(query, [nodeId]);
+  return result.rows[0];
+}
+
+export async function updateParkingState(nodeId, newState, sessionId = null) {
+  let query;
+  let values;
+  
+  if (sessionId) {
+    query = `
+      UPDATE parking_sessions 
+      SET parking_state = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *;
+    `;
+    values = [newState, sessionId];
+  } else {
+    // Update most recent active session
+    query = `
+      UPDATE parking_sessions 
+      SET parking_state = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE node_id = $2 AND is_active = true
+      ORDER BY created_at DESC
+      LIMIT 1
+      RETURNING *;
+    `;
+    values = [newState, nodeId];
+  }
+  
+  const result = await pool.query(query, values);
+  return result.rows[0];
+}
+
+export async function updateSessionTimestamp(sessionId, fieldName) {
+  // fieldName: 'detection_time', 'vehicle_detection_time', or 'violation_time'
+  const query = `
+    UPDATE parking_sessions 
+    SET ${fieldName} = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+    RETURNING *;
+  `;
+  const result = await pool.query(query, [sessionId]);
+  return result.rows[0];
+}
+
+export async function getActiveParkingSession(nodeId) {
+  const query = `
+    SELECT * FROM parking_sessions 
+    WHERE node_id = $1 AND is_active = true
+    ORDER BY created_at DESC
+    LIMIT 1;
+  `;
+  const result = await pool.query(query, [nodeId]);
+  return result.rows[0];
+}
+
+export async function closeParkingSession(sessionId) {
+  const query = `
+    UPDATE parking_sessions 
+    SET is_active = false, updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+    RETURNING *;
+  `;
+  const result = await pool.query(query, [sessionId]);
   return result.rows[0];
 }
 

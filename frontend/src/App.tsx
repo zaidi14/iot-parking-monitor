@@ -1,23 +1,34 @@
 import { useEffect, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { api, Node, ViolationLog } from './services/api';
+import { ParkingProvider, useParking } from './context/ParkingContext';
+import PhoneCameraStream from './components/PhoneCameraStream';
+import ParkingStatusCard from './components/ParkingStatusCard';
 
-export default function App() {
+function AppContent() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [connected, setConnected] = useState(false);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [violations, setViolations] = useState<ViolationLog[]>([]);
   const [showVideo, setShowVideo] = useState<{[key: string]: boolean}>({});
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [streamingNode, setStreamingNode] = useState<string | null>(null);
+  const [liveFrames, setLiveFrames] = useState<{[key: string]: string}>({});
+  const { updateSession, setViolation, startTimer, stopTimer, resetSession } = useParking();
   
   useEffect(() => {
     api.getNodes().then(setNodes);
     
-    const socketInstance = io('http://localhost:3001');
-    setSocket(socketInstance);
+    const socketInstance = io('http://192.168.1.110:3000');
     
-    socketInstance.on('connect', () => setConnected(true));
-    socketInstance.on('disconnect', () => setConnected(false));
+    socketInstance.on('connect', () => {
+      console.log('✅ Connected');
+      setConnected(true);
+    });
+    
+    socketInstance.on('disconnect', () => {
+      console.log('❌ Disconnected');
+      setConnected(false);
+    });
     
     socketInstance.on('mqtt_event', (data: any) => {
       if (data.node) {
@@ -32,9 +43,75 @@ export default function App() {
         });
       }
     });
+
+    // Listen for parking state changes
+    socketInstance.on('parking_state_change', (data: any) => {
+      console.log('🚗 Parking state change:', data);
+      updateSession(data.nodeId, {
+        state: data.state,
+        message: data.message,
+        timerDuration: data.timerDuration
+      });
+    });
+
+    // Listen for vehicle detection with timer
+    socketInstance.on('vehicle_detected', (data: any) => {
+      console.log('🚗 Vehicle detected:', data);
+      updateSession(data.nodeId, {
+        state: 'VEHICLE_DETECTED',
+        message: data.message,
+        confidence: data.confidence,
+        timerDuration: data.timerDuration || 30
+      });
+
+      // Start timer that expires after timerDuration seconds
+      startTimer(data.nodeId, data.timerDuration || 30, () => {
+        console.log('⏲️ Timer expired for:', data.nodeId);
+        // Violation will be triggered by API call from ESP32
+      });
+    });
+
+    // Listen for violation detection
+    socketInstance.on('violation_detected', (data: any) => {
+      console.log('⚠️ Violation detected:', data);
+      stopTimer(data.nodeId);
+      updateSession(data.nodeId, {
+        state: 'VIOLATION',
+        message: data.message,
+        videoUrl: data.videoUrl
+      });
+      setViolation(data.nodeId, {
+        id: data.sessionId,
+        videoUrl: data.videoUrl,
+        timestamp: new Date(),
+        showRelayButton: true
+      });
+    });
+
+    // Listen for live phone camera frames
+    socketInstance.on('phone_frame', (data: any) => {
+      console.log('📹 Received frame for:', data.nodeId);
+      setLiveFrames(prev => ({
+        ...prev,
+        [data.nodeId]: data.frame
+      }));
+    });
+
+    socketInstance.on('phone_stream_stop', (data: any) => {
+      console.log('📹 Stream stopped for:', data.nodeId);
+      setLiveFrames(prev => {
+        const copy = {...prev};
+        delete copy[data.nodeId];
+        return copy;
+      });
+    });
+
+    socketInstance.on('video_relay_start', (data: any) => {
+      console.log('📹 Video relay started for:', data.nodeId);
+    });
     
     return () => { socketInstance.disconnect(); };
-  }, []);
+  }, [updateSession, setViolation, startTimer, stopTimer]);
   
   const loadViolations = async (nodeId: string) => {
     const logs = await api.getViolationLogs(nodeId);
@@ -42,51 +119,8 @@ export default function App() {
     setSelectedNode(nodeId);
   };
   
-  const handleDeleteNode = async (nodeId: string) => {
-    if (confirm(`Remove node ${nodeId}? This will delete all its data.`)) {
-      try {
-        await api.deleteNode(nodeId);
-        // Immediately remove from UI
-        setNodes(prev => prev.filter(n => n.node_id !== nodeId));
-        // Close violation modal if it's open for this node
-        if (selectedNode === nodeId) {
-          setSelectedNode(null);
-        }
-        // Remove video state
-        setShowVideo(prev => {
-          const copy = {...prev};
-          delete copy[nodeId];
-          return copy;
-        });
-        console.log(`✅ Node ${nodeId} removed`);
-      } catch (error) {
-        console.error('Failed to delete node:', error);
-        alert('Failed to delete node. Please try again.');
-      }
-    }
-  };
-  
-  const handleStartVideo = async (nodeId: string) => {
-    await api.startVideo(nodeId);
-    setShowVideo(prev => ({...prev, [nodeId]: true}));
-  };
-  
-  const handleStopVideo = async (nodeId: string) => {
-    await api.stopVideo(nodeId);
-    setShowVideo(prev => ({...prev, [nodeId]: false}));
-  };
-  
   const getStatusColor = (status: string | null) => {
     return status === 'online' ? '#10b981' : '#6b7280';
-  };
-  
-  const getParkingColor = (state: string | null) => {
-    switch (state) {
-      case 'violation': return '#ef4444';
-      case 'timer_running': return '#f59e0b';
-      case 'vehicle_detected': return '#3b82f6';
-      default: return '#6b7280';
-    }
   };
   
   return (
@@ -108,122 +142,33 @@ export default function App() {
         {nodes.length === 0 ? (
           <div style={{ background: 'white', padding: '60px', borderRadius: '8px', textAlign: 'center' }}>
             <p style={{ fontSize: '18px', color: '#6b7280', marginBottom: '8px' }}>
-              No parking nodes detected yet.
+              No parking nodes detected.
             </p>
             <p style={{ fontSize: '14px', color: '#9ca3af' }}>
-              Waiting for ESP32 devices to connect...
+              Connect ESP32 devices to start monitoring...
             </p>
           </div>
         ) : (
-          <div style={{ display: 'grid', gap: '20px', gridTemplateColumns: 'repeat(auto-fill, minmax(350px, 1fr))' }}>
+          <div style={{ display: 'grid', gap: '20px', gridTemplateColumns: 'repeat(auto-fill, minmax(380px, 1fr))' }}>
             {nodes.map(node => (
-              <div key={node.node_id} style={{ 
-                background: 'white', 
-                padding: '24px', 
-                borderRadius: '8px', 
-                boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-                border: node.last_parking_state === 'violation' ? '3px solid #ef4444' : '1px solid #e5e7eb',
-                position: 'relative'
-              }}>
-                <button
-                  onClick={() => handleDeleteNode(node.node_id)}
-                  title="Remove this node"
-                  style={{
-                    position: 'absolute',
-                    top: '12px',
-                    right: '12px',
-                    background: '#ef4444',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    padding: '6px 10px',
-                    cursor: 'pointer',
-                    fontSize: '12px',
-                    fontWeight: 'bold'
-                  }}
-                >
-                  ✕
-                </button>
-                
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', marginRight: '50px' }}>
-                  <h3 style={{ fontSize: '20px', fontWeight: 'bold' }}>Node {node.node_id}</h3>
-                  <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: getStatusColor(node.last_status) }} />
-                </div>
-                
-                {node.location && (
-                  <p style={{ color: '#6b7280', marginBottom: '8px', fontSize: '14px' }}>📍 {node.location}</p>
-                )}
-                
-                <div style={{ background: '#f9fafb', padding: '12px', borderRadius: '6px', marginBottom: '16px' }}>
-                  <p style={{ marginBottom: '8px' }}>
-                    <span style={{ color: '#6b7280', fontSize: '14px' }}>Status: </span>
-                    <span style={{ fontWeight: '500' }}>{node.last_status || 'Unknown'}</span>
-                  </p>
-                  <p style={{ marginBottom: '8px' }}>
-                    <span style={{ color: '#6b7280', fontSize: '14px' }}>Parking: </span>
-                    <span style={{ fontWeight: '500', color: getParkingColor(node.last_parking_state) }}>
-                      {node.last_parking_state || 'idle'}
-                    </span>
-                  </p>
-                  <p>
-                    <span style={{ color: '#6b7280', fontSize: '12px' }}>Updated: </span>
-                    <span style={{ fontSize: '12px' }}>{new Date(node.updated_at).toLocaleString()}</span>
-                  </p>
-                </div>
-                
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '12px' }}>
-                  {node.last_parking_state === 'violation' && (
-                    <button 
-                      onClick={() => api.silenceNode(node.node_id)}
-                      style={{ padding: '10px 16px', background: '#ef4444', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' }}
-                    >
-                      🔇 Silence
-                    </button>
-                  )}
-                  <button 
-                    onClick={() => api.resetNode(node.node_id)}
-                    style={{ padding: '10px 16px', background: '#6b7280', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' }}
-                  >
-                    🔄 Reset
-                  </button>
-                  {node.has_cam && (
-                    <>
-                      {!showVideo[node.node_id] ? (
-                        <button 
-                          onClick={() => handleStartVideo(node.node_id)}
-                          style={{ padding: '10px 16px', background: '#3b82f6', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' }}
-                        >
-                          ▶️ Video
-                        </button>
-                      ) : (
-                        <button 
-                          onClick={() => handleStopVideo(node.node_id)}
-                          style={{ padding: '10px 16px', background: '#f59e0b', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' }}
-                        >
-                          ⏸️ Stop
-                        </button>
-                      )}
-                    </>
-                  )}
-                </div>
-                
-                <button
-                  onClick={() => loadViolations(node.node_id)}
-                  style={{ width: '100%', padding: '10px', background: '#8b5cf6', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' }}
-                >
-                  📋 View Violations
-                </button>
-                
-                {showVideo[node.node_id] && node.last_video_url && (
-                  <div style={{ marginTop: '16px' }}>
-                    <img src={node.last_video_url} alt="Live stream" style={{ width: '100%', borderRadius: '6px', border: '2px solid #3b82f6' }} />
-                  </div>
-                )}
-              </div>
+              <ParkingStatusCard 
+                key={node.node_id}
+                nodeId={node.node_id}
+                location={node.location || undefined}
+              />
             ))}
           </div>
         )}
         
+        {/* Phone Camera Streaming Modal */}
+        {streamingNode && (
+          <PhoneCameraStream 
+            nodeId={streamingNode} 
+            onClose={() => setStreamingNode(null)} 
+          />
+        )}
+        
+        {/* Violation Logs Modal */}
         {selectedNode && (
           <div style={{
             position: 'fixed',
@@ -251,7 +196,7 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                <h2 style={{ fontSize: '24px', fontWeight: 'bold' }}>Violation Logs - {selectedNode}</h2>
+                <h2 style={{ fontSize: '24px', fontWeight: 'bold' }}>Violation History - {selectedNode}</h2>
                 <button
                   onClick={() => setSelectedNode(null)}
                   style={{ background: '#6b7280', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 16px', cursor: 'pointer' }}
@@ -261,7 +206,7 @@ export default function App() {
               </div>
               
               {violations.length === 0 ? (
-                <p style={{ textAlign: 'center', color: '#6b7280', padding: '40px' }}>No violations logged yet.</p>
+                <p style={{ textAlign: 'center', color: '#6b7280', padding: '40px' }}>No violations recorded.</p>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   {violations.map(log => (
@@ -287,5 +232,13 @@ export default function App() {
         )}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ParkingProvider>
+      <AppContent />
+    </ParkingProvider>
   );
 }

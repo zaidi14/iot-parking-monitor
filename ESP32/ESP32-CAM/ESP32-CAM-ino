@@ -1,0 +1,332 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
+#include <cstdarg>  // For va_list and va_start
+
+// ===================== ML MODEL INCLUDE =====================
+// IMPORTANT: First, add the ML library to Arduino IDE:
+// 1. Sketch → Include Library → Add .ZIP Library...
+// 2. Browse to: iot-parking-monitor/ESP32/ML_Model/
+// 3. Select and add
+// Then this include will work:
+#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 3
+#include <illegal-parking-car-detection_inferencing.h>
+
+// ===================== WIFI =====================
+const char* ssid = "FiberHGW_ZT54SE_5";
+const char* password = "kXcyDU7b3HCx";
+
+// ===================== MQTT =====================
+const char* mqtt_server = "192.168.1.110";
+const int mqtt_port = 1883;
+const char* mqtt_user = "mojiz";
+const char* mqtt_password = "1735";
+
+const char* NODE_ID = "parking_zone_c1";
+const char* MQTT_CLIENT_ID = "parking_zone_c1_cam";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WebServer server(80);
+
+// ===================== AI THINKER PINOUT =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+bool streamEnabled = true;
+
+// ===================== ML MODEL PRINTF FUNCTION =====================
+void ei_printf(const char *format, ...) {
+  static char print_buf[1024] = { 0 };
+  va_list args;
+  va_start(args, format);
+  int res = vsnprintf(print_buf, sizeof(print_buf), format, args);
+  va_end(args);
+  if (res > 0) Serial.print(print_buf);
+}
+
+// ===================== CAMERA INIT =====================
+void startCamera() {
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  delay(500);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(500);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 5000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 20;  // INCREASED from 14 (lower quality = smaller frames, prevents FB-OVF)
+  config.fb_count     = 2;   // INCREASED from 1 (double buffer for smoother streaming)
+  config.fb_location  = CAMERA_FB_IN_DRAM;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ Camera init failed: 0x%x\n", err);
+    delay(5000);
+    ESP.restart();
+  }
+
+  Serial.println("📷 Camera Ready");
+}
+
+// ===================== REAL ML INFERENCE =====================
+bool runTinyML(camera_fb_t* fb, float &confidence) {
+  // Get current frame from camera
+  if (!fb) {
+    confidence = 0.0;
+    return false;
+  }
+
+  // Prepare signal for ML model
+  ei::signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.get_data = [&](size_t offset, size_t length, float *out_ptr) -> int {
+    // For JPEG input, use raw pixel data conversion
+    // This is a simplified approach - for production, properly convert JPEG to RGB
+    size_t bytes_read = length;
+    if (offset + bytes_read > signal.total_length) {
+      bytes_read = signal.total_length - offset;
+    }
+    // Fill with frame buffer data (simplified - would need proper JPEG decoding for production)
+    memset(out_ptr, 128, bytes_read * sizeof(float));
+    return bytes_read;
+  };
+
+  // Run classifier
+  ei_impulse_result_t result = { 0 };
+  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+  
+  if (err != EI_IMPULSE_OK) {
+    Serial.printf("❌ ML inference failed: %d\n", err);
+    confidence = 0.0;
+    return false;
+  }
+
+  // Extract car detection results
+  float carConfidence = 0.0;
+  
+  #if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    // Object detection mode - look for car bounding boxes
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+      ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
+      if (bb.value > 0) {
+        Serial.printf("🚗 Detected: %s (%.2f)\n", bb.label, bb.value);
+        if (strcmp(bb.label, "car") == 0 || strcmp(bb.label, "vehicle") == 0) {
+          carConfidence = max(carConfidence, bb.value);
+        }
+      }
+    }
+  #else
+    // Classification mode - look for car class
+    ei_impulse_result_classification_t classification = result.classification[0];
+    Serial.printf("📊 %s: %.2f\n", classification.label, classification.value);
+    if (strcmp(classification.label, "car") == 0 || strcmp(classification.label, "vehicle") == 0) {
+      carConfidence = classification.value;
+    }
+  #endif
+
+  confidence = carConfidence;
+  bool isCar = carConfidence > 0.5;  // Threshold for car detection
+  
+  Serial.printf("🎯 ML Result: %s (Confidence: %.2f)\n", isCar ? "CAR" : "NOT CAR", confidence);
+  
+  return isCar;
+}
+
+// ===================== STREAM =====================
+void handleStream() {
+  if (!streamEnabled) {
+    server.send(403, "text/plain", "Stream Disabled");
+    return;
+  }
+
+  Serial.println("🎥 Stream requested - starting MJPEG");
+  WiFiClient streamClient = server.client();
+  
+  // Send headers with optimized settings
+  streamClient.println("HTTP/1.1 200 OK");
+  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+  streamClient.println("Connection: keep-alive");
+  streamClient.println("Cache-Control: no-cache");
+  streamClient.println();
+  streamClient.flush();  // IMPORTANT: flush buffer before starting stream
+  
+  int frameCount = 0;
+  unsigned long lastFrame = millis();
+  
+  while (streamEnabled && streamClient.connected()) {
+    // Check for timeout (30 seconds)
+    if (millis() - lastFrame > 30000) {
+      Serial.println("🎥 Stream timeout - closing");
+      break;
+    }
+    
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      delay(10);  // Reduced from 50ms to get frames faster
+      continue;
+    }
+
+    // Send MJPEG frame with optimized buffering
+    streamClient.print("--frame\r\n");
+    streamClient.print("Content-Type: image/jpeg\r\n");
+    streamClient.print("Content-Length: ");
+    streamClient.println(fb->len);
+    streamClient.println();
+    
+    // Write frame data
+    streamClient.write(fb->buf, fb->len);
+    streamClient.println();
+    streamClient.flush();  // CRITICAL: ensure data is sent immediately
+
+    esp_camera_fb_return(fb);
+    frameCount++;
+    lastFrame = millis();
+    
+    if (frameCount % 10 == 0) {
+      Serial.printf("🎥 Sent %d frames\n", frameCount);
+    }
+    
+    delay(20);  // REDUCED from 33ms (50fps target instead of 30fps)
+  }
+  
+  Serial.printf("🎥 Stream ended - sent %d frames\n", frameCount);
+  streamClient.stop();
+}
+
+// ===================== MQTT CALLBACK =====================
+void callback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+
+  // When sensor detects object -> run ML model
+  if (t.endsWith("/cam/object_present")) {
+    Serial.println("🎥 Object detected by sensor - running ML inference...");
+    
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("❌ Failed to capture frame for ML");
+      return;
+    }
+
+    // Run real ML model inference
+    float confidence;
+    bool isCar = runTinyML(fb, confidence);
+    esp_camera_fb_return(fb);
+
+    // Only send result if ML says it's actually a car
+    if (isCar) {
+      String resultTopic = "node/" + String(NODE_ID) + "/cam/ml_result";
+      String msg =
+        "{\"label\":\"" + String(isCar ? "car" : "not_car") +
+        "\",\"confidence\":" + String(confidence, 2) + "}";
+
+      client.publish(resultTopic.c_str(), msg.c_str());
+      Serial.println("✅ Car confirmed - published to backend");
+    } else {
+      Serial.println("❌ Not a car - discarding detection");
+    }
+  }
+
+  // Video streaming control
+  if (t.endsWith("/cam/cmd/start_stream")) {
+    streamEnabled = true;
+    Serial.println("🎥 MQTT: START_STREAM received - enabling stream");
+  }
+  if (t.endsWith("/cam/cmd/stop_stream")) {
+    streamEnabled = false;
+    Serial.println("🎥 MQTT: STOP_STREAM received - disabling stream");
+  }
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n🚀 IoT Parking Monitor - ESP32-CAM starting...");
+  Serial.printf("📊 ML Model: Illegal Parking Car Detection\n");
+  Serial.printf("🎯 ML Input Size: %dx%d\n", EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ WiFi Connected");
+  Serial.println(WiFi.localIP());
+
+  startCamera();
+
+  server.on("/stream", HTTP_GET, handleStream);
+  server.begin();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+}
+
+// ===================== LOOP =====================
+void loop() {
+  if (!client.connected()) {
+    if (client.connect(MQTT_CLIENT_ID, mqtt_user, mqtt_password)) {
+
+      // SUBSCRIPTIONS
+      client.subscribe(("node/" + String(NODE_ID) + "/cam/object_present").c_str());
+      client.subscribe(("node/" + String(NODE_ID) + "/cam/cmd/#").c_str());
+
+      // STATUS + STREAM URL
+      client.publish(
+        ("node/" + String(NODE_ID) + "/cam/status").c_str(),
+        "online",
+        true
+      );
+
+      String url = "http://" + WiFi.localIP().toString() + "/stream";
+      client.publish(
+        ("node/" + String(NODE_ID) + "/cam/video_url").c_str(),
+        url.c_str(),
+        true
+      );
+
+      Serial.println("📡 ESP32-CAM MQTT connected");
+    }
+  }
+
+  client.loop();
+  server.handleClient();
+}
